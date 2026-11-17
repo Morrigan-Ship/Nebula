@@ -15,6 +15,7 @@ permissions:
 jobs:
   build:
     name: Build (${{ matrix.platform }})
+
     strategy:
       fail-fast: false
       matrix:
@@ -29,6 +30,7 @@ jobs:
     env:
       DOTNET_NOLOGO: true
       DOTNET_CLI_TELEMETRY_OPTOUT: true
+      BUILD_PLATFORM: ${{ matrix.platform }}
 
     steps:
       - name: Checkout
@@ -43,28 +45,40 @@ jobs:
         shell: pwsh
         run: |
           dotnet build tools\Nebula.Embed.Cli\Nebula.Embed.Cli.csproj -c Release
+          if ($LASTEXITCODE -ne 0) { throw "Embed CLI build failed." }
+
           dotnet build tools\Nebula.Import\Nebula.Import.csproj -c Release
+          if ($LASTEXITCODE -ne 0) { throw "Import build failed." }
 
       - name: Restore app
         shell: pwsh
-        run: dotnet restore src\Nebula.Windows\Nebula.Windows.csproj -p:Platform=${{ matrix.platform }} -p:Configuration=Release
+        run: |
+          dotnet restore src\Nebula.Windows\Nebula.Windows.csproj -p:Platform=$env:BUILD_PLATFORM -p:Configuration=Release
+          if ($LASTEXITCODE -ne 0) { throw "Restore failed." }
 
-      # Hosted runners have no GPU: compile renderer smoke tests without running them.
       - name: Build renderer
         shell: pwsh
-        run: .\src\Nebula.Render\build.ps1 -Architecture ${{ matrix.platform }} -Configuration Release -BuildTestsOnly
+        run: |
+          .\src\Nebula.Render\build.ps1 -Architecture $env:BUILD_PLATFORM -Configuration Release -BuildTestsOnly
+          if ($LASTEXITCODE -ne 0) { throw "Renderer build failed." }
 
       - name: Build app
         shell: pwsh
-        run: dotnet build src\Nebula.Windows\Nebula.Windows.csproj -p:Platform=${{ matrix.platform }} -c Release --no-restore -p:NebulaSkipNativeBuild=true
+        run: |
+          dotnet build src\Nebula.Windows\Nebula.Windows.csproj -p:Platform=$env:BUILD_PLATFORM -c Release --no-restore -p:NebulaSkipNativeBuild=true
+          if ($LASTEXITCODE -ne 0) { throw "App build failed." }
 
       - name: Core checks
         shell: pwsh
-        run: dotnet run -c Release --project tests\Nebula.Core.Tests
+        run: |
+          dotnet run -c Release --project tests\Nebula.Core.Tests
+          if ($LASTEXITCODE -ne 0) { throw "Core tests failed." }
 
       - name: Engine verification
         shell: pwsh
-        run: dotnet run -c Release --project tools\Nebula.Embed.Cli -- --bench --stage verify --sizes 2 --out "$env:RUNNER_TEMP\bench"
+        run: |
+          dotnet run -c Release --project tools\Nebula.Embed.Cli -- --bench --stage verify --sizes 2 --out "$env:RUNNER_TEMP\bench"
+          if ($LASTEXITCODE -ne 0) { throw "Engine verification failed." }
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
@@ -73,6 +87,7 @@ jobs:
         shell: pwsh
         env:
           RELEASE_TAG: ${{ github.ref_name }}
+          GITHUB_REF: ${{ github.ref }}
         run: |
           $manifestPath = "src\Nebula.Windows\Package.appxmanifest"
 
@@ -102,7 +117,7 @@ jobs:
       - name: Build and package MSIX
         shell: pwsh
         run: |
-          $packageDir = Join-Path $env:GITHUB_WORKSPACE "packages\${{ matrix.platform }}"
+          $packageDir = Join-Path $env:GITHUB_WORKSPACE "packages\$env:BUILD_PLATFORM"
           New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
           $packageDir = $packageDir.TrimEnd('\') + '\'
 
@@ -110,7 +125,7 @@ jobs:
             -restore `
             -t:Build `
             -p:Configuration=Release `
-            -p:Platform=${{ matrix.platform }} `
+            -p:Platform=$env:BUILD_PLATFORM `
             -p:NebulaSkipNativeBuild=true `
             -p:GenerateAppxPackageOnBuild=true `
             -p:AppxPackageSigningEnabled=false `
@@ -136,7 +151,7 @@ jobs:
           $releaseDir = Join-Path $env:GITHUB_WORKSPACE "release"
           New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
 
-          $destination = Join-Path $releaseDir "Nebula-${{ matrix.platform }}.msix"
+          $destination = Join-Path $releaseDir "Nebula-$env:BUILD_PLATFORM.msix"
           Copy-Item $packages[0].FullName $destination -Force
 
           Write-Host "Created: $destination"
@@ -145,7 +160,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nebula-msix-${{ matrix.platform }}
-          path: release\Nebula-${{ matrix.platform }}.msix
+          path: release/Nebula-${{ matrix.platform }}.msix
           if-no-files-found: error
           retention-days: 7
 
