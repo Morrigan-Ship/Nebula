@@ -1,8 +1,11 @@
+
 name: Build
 
 on:
   push:
     branches: [main]
+    tags:
+      - 'v*'
   pull_request:
   workflow_dispatch:
 
@@ -20,14 +23,19 @@ jobs:
             runner: windows-latest
           - platform: ARM64
             runner: windows-11-arm
+
     runs-on: ${{ matrix.runner }}
+
     env:
       DOTNET_NOLOGO: true
       DOTNET_CLI_TELEMETRY_OPTOUT: true
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-dotnet@v4
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
         with:
           global-json-file: global.json
 
@@ -57,3 +65,109 @@ jobs:
       - name: Engine verification
         shell: pwsh
         run: dotnet run -c Release --project tools\Nebula.Embed.Cli -- --bench --stage verify --sizes 2 --out "$env:RUNNER_TEMP\bench"
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Set MSIX version
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $manifestPath = "src\Nebula.Windows\Package.appxmanifest"
+
+          [xml]$manifest = Get-Content $manifestPath -Raw
+          $identity = $manifest.SelectSingleNode("//*[local-name()='Identity']")
+
+          if ($null -eq $identity) {
+            throw "Package Identity not found."
+          }
+
+          if ($env:GITHUB_REF -match '^refs/tags/v') {
+            if ($env:RELEASE_TAG -notmatch '^v(?<version>\d+\.\d+\.\d+)(?:-[0-9A-Za-z.-]+)?$') {
+              throw "Invalid release tag: $env:RELEASE_TAG"
+            }
+
+            $identity.SetAttribute("Version", $Matches['version'] + '.0')
+            $manifest.Save((Resolve-Path $manifestPath).Path)
+            Write-Host "Release version: $($Matches['version']).0"
+          }
+          else {
+            Write-Host "Using manifest version: $($identity.GetAttribute('Version'))"
+          }
+
+      - name: Build and package MSIX
+        shell: pwsh
+        run: |
+          $packageDir = Join-Path $env:GITHUB_WORKSPACE "packages\${{ matrix.platform }}"
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          $packageDir = $packageDir.TrimEnd('\') + '\'
+
+          msbuild src\Nebula.Windows\Nebula.Windows.csproj `
+            -restore `
+            -t:Build `
+            -p:Configuration=Release `
+            -p:Platform=${{ matrix.platform }} `
+            -p:NebulaSkipNativeBuild=true `
+            -p:GenerateAppxPackageOnBuild=true `
+            -p:AppxPackageSigningEnabled=false `
+            -p:AppxBundle=Never `
+            -p:UapAppxPackageBuildMode=SideloadOnly `
+            -p:PublishTrimmed=false `
+            "-p:AppxPackageDir=$packageDir"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "MSIX packaging failed."
+          }
+
+          $packages = @(
+            Get-ChildItem -Path $packageDir -Filter *.msix -Recurse |
+            Where-Object { $_.FullName -notmatch '[\\/]Dependencies[\\/]' }
+          )
+
+          if ($packages.Count -ne 1) {
+            $packages | ForEach-Object { Write-Host $_.FullName }
+            throw "Expected exactly one main MSIX package, found $($packages.Count)."
+          }
+
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE "release"
+          New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+
+          $destination = Join-Path $releaseDir "Nebula-${{ matrix.platform }}.msix"
+          Copy-Item $packages[0].FullName $destination -Force
+
+          Write-Host "Created: $destination"
+
+      - name: Upload MSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nebula-msix-${{ matrix.platform }}
+          path: release\Nebula-${{ matrix.platform }}.msix
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download MSIX packages
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Nebula ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            release/**/*.msix
