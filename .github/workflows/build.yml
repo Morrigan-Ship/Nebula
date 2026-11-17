@@ -66,43 +66,41 @@ jobs:
         shell: pwsh
         run: dotnet run -c Release --project tools\Nebula.Embed.Cli -- --bench --stage verify --sizes 2 --out "$env:RUNNER_TEMP\bench"
 
-      # Only tag builds need MSIX packaging.
       - name: Setup MSBuild
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: microsoft/setup-msbuild@v2
 
-      - name: Set MSIX version from tag
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Set MSIX version
         shell: pwsh
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          if ($env:RELEASE_TAG -notmatch '^v(?<version>\d+\.\d+\.\d+)(?:-[0-9A-Za-z.-]+)?$') {
-            throw "Invalid release tag: $env:RELEASE_TAG. Expected v1.2.3 or v1.2.3-beta.1"
-          }
-
-          $version = $Matches['version'] + '.0'
           $manifestPath = "src\Nebula.Windows\Package.appxmanifest"
 
           [xml]$manifest = Get-Content $manifestPath -Raw
           $identity = $manifest.SelectSingleNode("//*[local-name()='Identity']")
 
           if ($null -eq $identity) {
-            throw "Package Identity not found in $manifestPath"
+            throw "Package Identity not found."
           }
 
-          $identity.SetAttribute("Version", $version)
-          $manifest.Save((Resolve-Path $manifestPath).Path)
+          if ($env:GITHUB_REF -match '^refs/tags/v') {
+            if ($env:RELEASE_TAG -notmatch '^v(?<version>\d+\.\d+\.\d+)(?:-[0-9A-Za-z.-]+)?$') {
+              throw "Invalid release tag: $env:RELEASE_TAG"
+            }
 
-          Write-Host "MSIX package version: $version"
+            $identity.SetAttribute("Version", $Matches['version'] + '.0')
+            $manifest.Save((Resolve-Path $manifestPath).Path)
+            Write-Host "Release version: $($Matches['version']).0"
+          }
+          else {
+            Write-Host "Using manifest version: $($identity.GetAttribute('Version'))"
+          }
 
       - name: Build and package MSIX
-        if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         run: |
           $packageDir = Join-Path $env:GITHUB_WORKSPACE "packages\${{ matrix.platform }}"
           New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
-
           $packageDir = $packageDir.TrimEnd('\') + '\'
 
           msbuild src\Nebula.Windows\Nebula.Windows.csproj `
@@ -128,7 +126,6 @@ jobs:
           )
 
           if ($packages.Count -ne 1) {
-            Write-Host "Found MSIX packages:"
             $packages | ForEach-Object { Write-Host $_.FullName }
             throw "Expected exactly one main MSIX package, found $($packages.Count)."
           }
@@ -139,10 +136,9 @@ jobs:
           $destination = Join-Path $releaseDir "Nebula-${{ matrix.platform }}.msix"
           Copy-Item $packages[0].FullName $destination -Force
 
-          Write-Host "Created package: $destination"
+          Write-Host "Created: $destination"
 
       - name: Upload MSIX artifact
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v4
         with:
           name: nebula-msix-${{ matrix.platform }}
